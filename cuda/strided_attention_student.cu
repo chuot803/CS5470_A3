@@ -106,32 +106,39 @@ __global__ void strided_attention_forward_kernel(
     __shared__ T reduced_max[32];
     __shared__ T reduced_sum[32];
 
-    assert(blockDim.x <= 256);
-    assert(32 * warpSize > blockDim.x);
+    // assert(blockDim.x <= 256);
+    // assert(32 * warpSize > blockDim.x);
+
+    using AccT = typename std::conditional<std::is_same<T, double>::value, double, float>::type;
 
     const int strided_seq_len = (seq_len + stride - 1) / stride;
     const T scale = static_cast<T>(1.0 / sqrt(static_cast<double>(head_dim)));
 
-    // load q_i and other arrays
+    // load q_i
     for (int i = idx; i < head_dim; i += blockDim.x) {
         q[i] = q_ptr[q_offset + i];
     }
 
     __syncthreads();
     
-    // scores (strided)
-    for (int i = idx; i < strided_seq_len; i += blockDim.x) {
+    // scores (strided) + warp
+    for (int i = warp_id; i < strided_seq_len; i += num_warps) {
         T sum = static_cast<T>(0.0);
         long k_offset = bh_offset + (long)i * stride * head_dim;
-        for (int j = 0; j < head_dim; ++j) {
+
+        for (int j = lane_id; j < head_dim; j += warpSize) {
             sum += q[j] * k_ptr[k_offset + j];
         }
-        scores[i] = sum * scale;
+
+        sum = warp_sum(sum);
+        if (lane_id == 0) {
+            scores[i] = sum * scale;
+        }
     }
 
     __syncthreads();
 
-    // max
+    // max_scores
     {
         T val = idx < strided_seq_len ? scores[idx] : static_cast<T>(-INFINITY);
         val = warp_max(val);
@@ -142,7 +149,7 @@ __global__ void strided_attention_forward_kernel(
 
     __syncthreads();
 
-    // max continue
+    // max_scores continue
     if (warp_id == 0) {
         T val = lane_id < num_warps ? reduced_max[lane_id] : static_cast<T>(-INFINITY);
         val = warp_max(val);
@@ -154,15 +161,14 @@ __global__ void strided_attention_forward_kernel(
 
     __syncthreads();
 
-    // scores -> shifted -> exp
-    using AccT = typename std::conditional<std::is_same<T, double>::value, double, float>::type;
+    // scores -> shifted -> exps
     for (int i = idx; i < strided_seq_len; i += blockDim.x) {
         scores[i] = static_cast<T>(exp(static_cast<AccT>(scores[i] - reduced_max[0])));
     }
 
     __syncthreads();
 
-    // sum
+    // sums
     {
         T val = idx < strided_seq_len ? scores[idx] : static_cast<T>(0.0);
         val = warp_sum(val);
@@ -173,7 +179,7 @@ __global__ void strided_attention_forward_kernel(
 
     __syncthreads();
 
-    // sum continue
+    // sums continue
     if (warp_id == 0) {
         T val = lane_id < num_warps ? reduced_sum[lane_id] : static_cast<T>(0.0);
         val = warp_sum(val);
@@ -184,7 +190,7 @@ __global__ void strided_attention_forward_kernel(
 
     __syncthreads();
 
-    // exp / sum
+    // weights = exps / sums
     for (int i = idx; i < strided_seq_len; i += blockDim.x) {
         scores[i] /= reduced_sum[0];
     } 
@@ -200,6 +206,19 @@ __global__ void strided_attention_forward_kernel(
         }
         output_ptr[output_offset + i] = output;
     }
+
+    // warp version, even slower, because stride >> 1
+    // for (int d = warp_id; d < head_dim; d += num_warps) {
+    //     T sum = 0.0;
+    //     for (int j = lane_id; j < strided_seq_len; j += warpSize) {
+    //         long v_offset = bh_offset + (long)j * stride * head_dim;
+    //         sum += scores[j] * v_ptr[v_offset + d];
+    //     }
+    //     sum = warp_sum(sum);
+    //     if (lane_id == 0) {
+    //         output_ptr[output_offset + d] = sum;
+    //     }
+    // }
 }
 
 
